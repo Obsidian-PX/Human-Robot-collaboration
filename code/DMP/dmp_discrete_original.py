@@ -1,0 +1,270 @@
+# -*- coding: utf-8 -*-
+'''
+This code is implemented by Chauby, it is free for everyone.
+Email: chaubyZou@163.com
+'''
+
+#%% import package
+import numpy as np
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+from cs import CanonicalSystem
+
+#%% define discrete dmp
+class dmp_discrete():
+    def __init__(self, n_dmps=1, n_bfs=100, dt=0, alpha_y=None, beta_y=None, **kwargs):
+        self.n_dmps = n_dmps # number of data dimensions, one dmp for one degree   数据维度的数量，一个dmp表示一个度
+        self.n_bfs = n_bfs # number of basis functions 基函数数量
+        self.dt = dt
+
+        self.y0 = np.zeros(n_dmps)  # for multiple dimensions 用于多个维度
+        self.goal = np.ones(n_dmps) # for multiple dimensions
+
+        alpha_y_tmp = 60 if alpha_y is None else alpha_y     #初始化了两个参数 `alpha_y` 和 `beta_y`，它们分别控制 DMP 的阻尼和刚度。
+        beta_y_tmp = alpha_y_tmp / 4.0  if beta_y is None else beta_y
+        self.alpha_y = np.ones(n_dmps) * alpha_y_tmp
+        self.beta_y = np.ones(n_dmps) * beta_y_tmp
+        self.tau = 1.0
+
+        self.w = np.zeros((n_dmps, n_bfs)) # weights for forcing term  强制项的权重
+        self.psi_centers = np.zeros(self.n_bfs) # centers over canonical system for Gaussian basis functions  高斯基函数正则系统上的中心
+        self.psi_h = np.zeros(self.n_bfs) # variance over canonical system for Gaussian basis functions  高斯基函数正则系统上的方差
+
+        # canonical system  规范系统
+        self.cs = CanonicalSystem(dt=self.dt, **kwargs)
+        self.timesteps = round(self.cs.run_time / self.dt)
+
+        # generate centers for Gaussian basis functions  生成高斯基函数的中心
+        self.generate_centers()
+
+        # self.h = np.ones(self.n_bfs) * self.n_bfs / self.psi_centers # original
+        self.h = np.ones(self.n_bfs) * self.n_bfs**1.5 / self.psi_centers / self.cs.alpha_x # chose from trail and error 从跟踪和错误中选择
+
+        # reset state 复位状态
+        self.reset_state()
+
+    # Reset the system state  重置系统状态
+    def reset_state(self):
+        self.y = self.y0.copy()   #重设目标位置为初始位置
+        self.dy = np.zeros(self.n_dmps)   #重设目标位置的一阶导数（速度）为零
+        self.ddy = np.zeros(self.n_dmps)  #重设目标位置的二阶导数（加速度）为零
+        self.cs.reset_state()   #重设 canonical system 的状态
+
+    def generate_centers(self):
+        t_centers = np.linspace(0, self.cs.run_time, self.n_bfs) # centers over time 中心随时间变化
+
+        cs = self.cs
+        x_track = cs.run() # get all x over run time 获得运行时间内所有x
+        t_track = np.linspace(0, cs.run_time, cs.timesteps) # get all time ticks over run time 获取运行时间内的所有时间刻度
+
+        for n in range(len(t_centers)):
+            for i, t in enumerate(t_track):
+                if abs(t_centers[n] - t) <= cs.dt: # find the x center corresponding to the time center 找到与时间中心对应的x中心
+                    self.psi_centers[n] = x_track[i]
+        
+        return self.psi_centers
+
+    def generate_psi(self, x):
+        if isinstance(x, np.ndarray):
+            x = x[:, None]
+
+        self.psi = np.exp(-self.h * (x - self.psi_centers)**2)
+
+        return self.psi
+    
+    def generate_weights(self, f_target):
+        x_track = self.cs.run()
+        psi_track = self.generate_psi(x_track)
+
+        for d in range(self.n_dmps):
+            # ------------ Original DMP in Schaal 2002
+            delta = self.goal[d] - self.y0[d]
+
+            for b in range(self.n_bfs):
+                # as both number and denom has x(g-y_0) term, thus we can simplify the calculation process  由于数字和denom都有x（g-y0）项，因此我们可以简化计算过程
+                numer = np.sum(x_track * psi_track[:,b] * f_target[:,d])
+                denom = np.sum(x_track**2 * psi_track[:,b])
+
+                self.w[d, b] = numer / denom
+                if abs(delta) > 1e-6:
+                    self.w[d, b] = self.w[d, b] / delta
+                
+        self.w = np.nan_to_num(self.w)
+
+        return self.w
+
+    def learning(self, y_demo, plot=False):
+        if y_demo.ndim == 1: # data is with only one dimension  数据只有一个维度
+            y_demo = y_demo.reshape(1, len(y_demo))
+
+        self.y0 = y_demo[:,0].copy()
+        self.goal = y_demo[:,-1].copy()
+        self.y_demo = y_demo.copy()
+
+        # interpolate the demonstrated trajectory to be the same length with timesteps  将演示的轨迹插值为与时间步长相同的长度
+        x = np.linspace(0, self.cs.run_time, y_demo.shape[1])
+        y = np.zeros((self.n_dmps, self.timesteps))
+        for d in range(self.n_dmps):
+            y_tmp = interp1d(x, y_demo[d])
+            for t in range(self.timesteps):
+                y[d, t] = y_tmp(t*self.dt)
+        
+        # calculate velocity and acceleration of y_demo  y演示的速度和加速度计算
+
+        # method 1: using gradient  方法1：使用渐变
+        dy_demo = np.gradient(y, axis=1) / self.dt
+        ddy_demo = np.gradient(dy_demo, axis=1) / self.dt
+
+        # method 2: using diff  方法2：使用diff
+        # dy_demo = np.diff(y) / self.dt
+        # # let the first gradient same as the second gradient  使第一个梯度与第二个梯度相同
+        # dy_demo = np.hstack((np.zeros((self.n_dmps, 1)), dy_demo)) # Not sure if is it a bug? 不确定这是不是一个bug？
+        # # dy_demo = np.hstack((dy_demo[:,0].reshape(self.n_dmps, 1), dy_demo))
+
+        # ddy_demo = np.diff(dy_demo) / self.dt
+        # # let the first gradient same as the second gradient
+        # ddy_demo = np.hstack((np.zeros((self.n_dmps, 1)), ddy_demo))
+        # # ddy_demo = np.hstack((ddy_demo[:,0].reshape(self.n_dmps, 1), ddy_demo))
+
+        x_track = self.cs.run()
+        f_target = np.zeros((y_demo.shape[1], self.n_dmps))
+        for d in range(self.n_dmps):
+            # ---------- Original DMP in Schaal 2002
+            f_target[:,d] = ddy_demo[d] - self.alpha_y[d]*(self.beta_y[d]*(self.goal[d] - y_demo[d]) - dy_demo[d])
+        
+        self.generate_weights(f_target)
+
+        if plot is True:
+            # plot the basis function activations 激活绘制基函数
+            plt.figure()
+            plt.subplot(211)
+            psi_track = self.generate_psi(self.cs.run())
+            plt.plot(psi_track)
+            plt.title('basis functions')
+
+            # plot the desired forcing function vs approx  绘制所需强制函数与近似值的关系图
+            plt.subplot(212)
+            plt.plot(f_target[:,0])
+            plt.plot(np.sum(psi_track * self.w[0], axis=1) * self.dt)
+            plt.legend(['f_target', 'w*psi'])
+            plt.title('DMP forcing function')
+            plt.tight_layout()
+            plt.show()
+
+        # reset state
+        self.reset_state()
+
+
+    def reproduce(self, tau=None, initial=None, goal=None):
+        # set temporal scaling  设置时间缩放
+        if tau == None:
+            timesteps = self.timesteps
+        else:
+            timesteps = round(self.timesteps/tau)
+
+        # set initial state  设置初始状态
+        if initial != None:
+            self.y0 = initial
+        
+        # set goal state   设定目标状态
+        if goal != None:
+            self.goal = goal
+        
+        # reset state
+        self.reset_state()
+
+        y_reproduce = np.zeros((timesteps, self.n_dmps))
+        dy_reproduce = np.zeros((timesteps, self.n_dmps))
+        ddy_reproduce = np.zeros((timesteps, self.n_dmps))
+
+        for t in range(timesteps):
+            y_reproduce[t], dy_reproduce[t], ddy_reproduce[t] = self.step(tau=tau)
+        
+        return y_reproduce, dy_reproduce, ddy_reproduce
+
+    def step(self, tau=None):
+        # run canonical system  运行规范系统
+        if tau == None:
+            tau = self.tau
+        x = self.cs.step_discrete(tau)
+
+        # generate basis function activation  激活生成基函数
+        psi = self.generate_psi(x)
+
+        for d in range(self.n_dmps):
+            # generate forcing term   生成强迫项
+            # ------------ Original DMP in Schaal 2002
+            f = np.dot(psi, self.w[d])*x*(self.goal[d] - self.y0[d]) / np.sum(psi)
+
+            # generate reproduced trajectory   生成再现轨迹
+            self.ddy[d] = self.alpha_y[d]*(self.beta_y[d]*(self.goal[d] - self.y[d]) - self.dy[d]) + f
+            self.dy[d] += tau*self.ddy[d]*self.dt
+            self.y[d] += tau*self.dy[d]*self.dt
+        
+        return self.y, self.dy, self.ddy
+
+
+#%% test code
+if __name__ == "__main__":
+    data_len = 500    #数据长度为500
+
+    # ----------------- For different initial and goal positions  对于不同的初始位置和目标位置
+    t = np.linspace(0, 1.5*np.pi, data_len)
+    y_demo = np.zeros((2, data_len))
+    y_demo[0,:] = np.sin(t)
+    y_demo[1,:] = np.cos(t)
+    
+    # DMP learning
+    dmp = dmp_discrete(n_dmps=y_demo.shape[0], n_bfs=100, dt=1.0/data_len)
+    dmp.learning(y_demo, plot=False)
+
+    # reproduce learned trajectory  再现学习轨迹
+    y_reproduce, dy_reproduce, ddy_reproduce = dmp.reproduce()
+
+    # set new initial and goal positions  设定新的初始和目标位置
+    y_reproduce_2, dy_reproduce_2, ddy_reproduce_2 = dmp.reproduce(tau=0.5, initial=[0.2, 0.8], goal=[-0.5, 0.2])
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(y_demo[0,:], 'g', label='demo sine')
+    plt.plot(y_reproduce[:,0], 'r--', label='reproduce sine')
+    plt.plot(y_reproduce_2[:,0], 'r-.', label='reproduce 2 sine')
+    plt.plot(y_demo[1,:], 'b', label='demo cosine')
+    plt.plot(y_reproduce[:,1], 'm--', label='reproduce cosine')
+    plt.plot(y_reproduce_2[:,1], 'm-.', label='reproduce 2 cosine')
+    plt.legend()
+    plt.grid()
+    plt.xlabel('time')
+    plt.ylabel('y')
+
+
+    # ----------------- For same initial and goal positions  对于相同的初始位置和目标位置
+    t = np.linspace(0, 2*np.pi, data_len)
+
+    y_demo = np.zeros((2, data_len))
+    y_demo[0,:] = np.sin(t)
+    y_demo[1,:] = np.cos(t)
+
+    # DMP learning
+    dmp = dmp_discrete(n_dmps=y_demo.shape[0], n_bfs=400, dt=1.0/data_len)
+    dmp.learning(y_demo, plot=False)
+
+    # reproduce learned trajectory
+    y_reproduce, dy_reproduce, ddy_reproduce = dmp.reproduce()
+
+    # set new initial and goal poisitions
+    y_reproduce_2, dy_reproduce_2, ddy_reproduce_2 = dmp.reproduce(tau=0.8, initial=[0.2, 0.8], goal=[0.5, 1.0])
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(y_demo[0,:], 'g', label='demo sine')
+    plt.plot(y_reproduce[:,0], 'r--', label='reproduce sine')
+    plt.plot(y_reproduce_2[:,0], 'r-.', label='reproduce 2 sine')
+    plt.plot(y_demo[1,:], 'b', label='demo cosine')
+    plt.plot(y_reproduce[:,1], 'm--', label='reproduce cosine')
+    plt.plot(y_reproduce_2[:,1], 'm-.', label='reproduce 2 cosine')
+    plt.legend(loc="upper right")
+    plt.ylim(-1.5, 3)
+    plt.grid()
+    plt.xlabel('time')
+    plt.ylabel('y')
+    plt.show()
